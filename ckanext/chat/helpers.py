@@ -1,5 +1,6 @@
 import ckan.plugins.toolkit as toolkit
 import requests
+import os
 
 
 def service_available():
@@ -18,7 +19,29 @@ def service_available():
         return False
 
 
+def load_prompt(config_key: str, default_filename: str, extension_dir: str) -> str:
+    """
+    Load a prompt either from a URL (if set in config) or from a local file.
+    """
+    prompt_url = toolkit.config.get(config_key, None)
+    if prompt_url:
+        try:
+            response = requests.get(prompt_url)
+            if response.status_code == 200:
+                return response.text
+            else:
+                print(f"Failed to retrieve {config_key} from URL. Status code: {response.status_code}")
+        except Exception as e:
+            print(f"Error fetching {config_key} from URL: {e}")
+
+    # fallback to local file
+    prompt_path = os.path.join(extension_dir, default_filename)
+    with open(prompt_path, "r", encoding="utf-8") as file:
+        return file.read()
+
+
 def get_helpers():
     return {
         "service_available": service_available,
     }
+

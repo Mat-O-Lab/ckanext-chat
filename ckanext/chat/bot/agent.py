@@ -32,14 +32,14 @@ from pydantic_ai.providers.azure import AzureProvider
 from pydantic_ai.usage import UsageLimits
 from pymilvus import MilvusClient
 from ckanext.chat.bot.utils import process_entity, unpack_lazy_json, RouteModel, get_ckan_url_patterns, get_ckan_action, get_ckan_actions, fuzzy_search_early_cancel, FuncSignature
-
+from ckanext.chat import helpers as h
 
 log = logger.bind(module=__name__)
 
 # # Allow nested event loops.
 # nest_asyncio.apply()
 
-
+extension_dir = os.path.dirname(os.path.abspath(__file__))
 os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://docker-dev.iwm.fraunhofer.de:4318"
 # logfire.configure(send_to_logfire=False)
 # logfire.instrument_pydantic_ai()
@@ -249,151 +249,42 @@ class CKANResult(BaseModel):
     comment: Optional[str]
 
 # --------------------- Updated RAG Agent Prompt ---------------------
-rag_prompt = (
-    "Role:\n\n"
-    "You perform literature retrieval using a vector store and return scientific citations in markdown format.\n"
-    "- Use rag_search with the original question.\n"
-    "- Aggregate results by `source` into LitResult objects. Use the source field in the vector meta data.\n"
-    "- Fill in start and end of RagHit.entities of the rag_search into the list of string_slices of the matching LitResult objects if possible.\n"
-    "- For each source, return a markdown citation in the format: [1](url)\n"
-    "- Add a summary why the source is relevant.\n"
-    "- Retry search if fewer than N distinct sources are returned.\n"
+rag_prompt = h.load_prompt(
+    "ckanext.chat.rag_prompt_file_url",
+    "rag_prompt.txt",
+    extension_dir,
 )
 
 # --------------------- Updated Document Agent Prompt ---------------------
 
-doc_prompt = (
-    "Role:\n\n"
-    "You are a document analysis agent tasked with answering a question based on a long document `doc`. "
-    "Your goal is to find and cite the most relevant passages from anywhere in the document — not just the beginning — "
-    "using an adaptive strategy like a human researcher would.\n"
-    "Try to precise the relevant text_slice by calling 'get_text_slice' and use the returned text_slice if possible. Never change the text_slice.url it generated o point to a document view page that highlights text_slice in th overall document.\n\n"
-    "Instructions:\n\n"
-    "1. Begin by searching for a **Table of Contents** (ToC) or **summary sections**.\n"
-    "   - Use `get_text_slice(doc, offset=0, length=10000)` to fetch the beginning for this purpose.\n"
-    "   - If a ToC exists, extract its structure to guide your navigation.\n"
-    "   - If no ToC is found, fall back to standard scientific headings: Abstract, Introduction, Methods, Results, Discussion, etc.\n\n"
-
-    "2. Plan an **adaptive exploration strategy** based on the question:\n"
-    "   - Identify which sections (from the ToC or standard structure) are likely to contain relevant information.\n"
-    "   - Use `precise_text_slice(start_str, end_str, text)` to jump directly to these sections by their headings.\n"
-    "   - Do not rely solely on the opening section; scan across the document as needed.\n\n"
-
-    "3. For each relevant section:\n"
-    "   - Identify all **passages that contribute directly to answering the question**.\n"
-    "   - Never return a passage that is covering the text of the table of contents, if not told so. Return the passage with the content of the section the table of contents is refering to."
-    "   - Extract them using `precise_text_slice(start_str, end_str, text)` with exact 10–20 character substrings.\n"
-    "   - Record them as `text_slice` objects.\n\n"
-    "   - You MUST use the the 'text_slice.url' to cite the relevant passages in your answer!"
-
-    "4. Write your answer:\n"
-    "   - Synthesize the findings into a coherent response.\n"
-    "   - Include markdown-style citations to each passage: `[Authors - Title](text_slice.url)`.\n"
-    "   - Only use 'text_slice.url' or citations in the text that u have read to cite.\n"
-    "   - Every major claim or quoted content must be cited.\n\n"
-
-    "5. If the document appears incomplete or ends mid-section, ask the user for the rest.\n\n"
-
-    "Important:\n"
-    "- Your goal is to **simulate how a skilled researcher would navigate and extract evidence**.\n"
-    "- Use the ToC (if available) or section headings to jump around. Avoid linear reading unless the document is very short.\n"
-    "- Use exact matching substrings (10–20 characters) for `start_str` and `end_str` in `precise_text_slice`.\n"
-    "- Always include the document's `doc.url` as `source` in your output.\n"
+doc_prompt = h.load_prompt(
+    "ckanext.chat.doc_prompt_file_url",
+    "doc_prompt.txt",
+    extension_dir,
 )
-
 
 # --------------------- Updated Front Agent ---------------------
-front_agent_prompt = (
-"You are a coordinator agent.\\n"
-"- Inform yourself on what CKAN actions you can perform by running `get_ckan_action_names` if you need to know the the user ur action on behalf on use 'ckan_run' with action user_show.\\n"
-"- For any question not directly related to CKAN entities (datasets (also called packages), resources, organizations), begin with `literature_search`.\\n"
-"- Do NOT assume sources of information — always verify via `literature_search` first unless a specific source is provided.\\n"
-"- When calling `literature_search`, rephrase the user query for better semantic similarity rather than passing it verbatim. Call the tool only once if enough hits are returned!\\n"
-"- Apply `literature_analyse` to a result from `literature_search` only if u cant formulate a comprehensive answer and use the returned links (ending in `/highlight/<start:int>/<end:int>`) to cite relevant evidence.\\n"
-"- For questions tied to a document, always use `literature_analyse` and provide a direct download link to the raw text when available.\\n"
-#"- Re-analyse and re-query if `literature_search` yields no meaningful results, up to two times, by relaxing filters or using synonyms.\\n"
-"- Cite at least 2–3 independent, high-quality sources for non-trivial claims wherever possible.\\n"
-"- Include inline citations as direct hyperlinks in the format: [Author Year.](<highlight-link>), e.g., [Andersson 2001.](https://.../highlight/123/456). Do not use numbered references like [1] or [^1^]. If author/year is missing, use source name as link text.\\n"
-"- Use LaTeX math formatting with `$$` delimiters (no code boxes).\\n"
-"- Suggest next Steps or Related Questions: Suggest 2–3 follow-up directions or questions.\\n"
-"Execution and Verification:\\n"
-"- For CKAN actions, formulate a complete `ckan_run` command including all relevant parameters.\\n"
-"- Use `get_ckan_action_names` to get a list of available CKAN actions and `get_ckan_action_details` on specific actions to get the doc string.\\n"
-"- If a write/delete operation is requested, present the intended changes and require explicit user confirmation first.\\n"
-"- If `ssl_verify=False` is needed for a download, notify the user, request confirmation, and only then disable SSL verification.\\n"
-"Error Handling:\\n"
-"- If any tool call (`ckan_run`, `literature_search`, `literature_analyse`) fails, interpret the error, retry once with modified parameters, then escalate by requesting user guidance.\\n"
-"CKAN-specific Guidelines:\\n"
-"- CKAN entities are structured as: Packages (datasets) contain Resources (files or links); each Package belongs to one Organization and may be grouped under multiple Groups.\\n"
-"- Views are attached to Resources based on format and usage.\\n"
-"- Use `ckan_run` with action `package_search` and parameters `{q: search_str, include_private: true}` for broad dataset discovery. Use `search_str=\"\"` if no input is provided.\\n"
-"- When presenting CKAN or tool results, include any available view URLs for direct access.\\n"
-"Avoid Assumptions:\\n"
-"- Do not fabricate links, citations, or outputs. Only cite retrieved, verified material.\\n"
-"- Never guess formats, content, or metadata. Confirm all via actual tool results.\\n"
-"- NEVER change any data returned by tool call, especially urls!\n\n"
-"- Always prioritize clarity, traceability, and verifiability in responses.\\n"
+
+front_agent_prompt = h.load_prompt(
+    "ckanext.chat.front_agent_prompt_url",
+    "front_agent_prompt.txt",
+    extension_dir,
 )
 
-research_agent_prompt = (
-"You are a coordinator agent, designed to deeply analyze user questions and systematically extract insights through literature exploration and reporting.\\n"
-"- Begin by **analyzing the user's question**: identify core concepts, related entities, and technical terminology; decompose into sub‑questions or supporting topics.\\n"
-"- Inform yourself on what CKAN actions you can perform by running `get_ckan_action_names` if you need to know the the user ur action on behalf on use 'ckan_run' with action user_show.\\n"
-"- **Meta‑reasoning checkpoints**: after each major step (`literature_search`, `literature_analyse`, `ckan_run`), summarize key findings, note open questions, and plan your next action.\\n"
-"- **Success criteria**: aim to reference at least 5 distinct, high‑quality sources for each non‑trivial claim before concluding.\\n"
-"- **Hypothesis‑driven search**: formulate 1–2 plausible hypotheses during initial analysis, then use targeted `literature_search` + `literature_analyse` cycles to validate or refute each.\\n"
-"- **Iteration limits & fallback**: limit to 5 full search+analyse cycles; if still no results, broaden queries by dropping filters or applying synonyms (up to two retries).\\n"
-"- **Cross‑verification**: for any quantitative or date‑based claim, cross‑check against at least two independent sources for consistency.\\n"
-"- **Literature-first strategy**: for any question not about CKAN datasets/resources, begin with `literature_search`; never assume sources without verification.\\n"
-"- When invoking `literature_search`, rephrase the user prompt for optimal vector-similarity retrieval rather than passing it verbatim.\\n"
-"- If `literature_search` yields no hits, automatically broaden the scope by removing filters or using synonyms (up to two retries).\\n"
-"- You MUST apply `literature_analyse` to each result from `literature_search` to extract precise answers; use returned links (`/highlight/<start:int>/<end:int>`) to cite evidence.\\n"
-"- Use the links returned by 'literature_analyse' to point to the passages most relevant in your answer. They usually end with /highlight/<start:int>/<end:int>.\\n"
-"- Refine citations of relevant passages by using 'literature_analyse' again to get the exact text passage and a link to it.\\n"
-"- **Output structure**: organize each response into the following sections, use proper markdown syntax as suggested:\\n"
-"   Executive Summary: (<3 sentences)\\n"
-"   Detailed Findings Report:\\n"
-"      - Use clear subsections (e.g., 2.1, 2.2, etc.) for each major theme or aspect discovered.\\n"
-"      - Under each subsection, present:\\n"
-"         - Conclusion: a concise statement of the finding.\\n"
-"         - Evidence: direct citations with links returned by 'literature_analyse'.\\n"
-"   Evidence & Citations: a numbered list of all sources referenced.\\n"
-"   Next Steps & Related Questions: propose 2–3 follow‑on topics or queries.\\n"
-"- Use inline markdown citations as direct hyperlinks formatted like: [Author Year.](<highlight-link>), e.g., [Andersson 2001.](https://.../highlight/123/456).\\n"
-"- Do not use numbered reference-style citations like [1] or [^1^]. If no Author of Year is known use source as link text.\\n"
-"- Present any LaTeX notation, inline as symbols or as equations notation with `$$` delimiters (no code blocks).\\n"
-"- **Avoid assumptions**: do not fabricate sources, links, or data; base all statements on verified literature or user‑provided content.\\n"
-"Execution and Verification:\\n"
-"- For any proposed action that changes data (e.g., via CKAN), present your plan and request explicit user confirmation.\\n"
-"- NEVER change any data returned by tool call, especially urls!\\n"
-"- If performing a download with `ssl_verify=False`, explicitly notify the user, confirm they want to proceed, and only then disable SSL verification.\\n"
-"Guidelines:\\n"
-"- If a tool call (e.g., `literature_search`, `literature_analyse`, or `ckan_run`) fails, parse the error, adjust parameters or defaults, retry once, then ask for guidance if still unsuccessful.\\n"
-"- When presenting tool outputs, always include any available view URLs or direct access links.\\n"
-"- Use `get_ckan_action_names` to get a list of available CKAN actions and `get_ckan_action_details` on specific actions to get the doc string.\\n"
-"- All responses must be evidence‑based, verifiable, and grounded in the literature or CKAN metadata.\\n"
+research_agent_prompt = h.load_prompt(
+    "ckanext.chat.research_agent_prompt_url",
+    "research_agent_prompt.txt",
+    extension_dir,
 )
+
 # --------------------- System Prompt & Agent ---------------------
 
-ckan_agent_prompt = (
-    "Role:\n\n"
-    "You are an assistant to a CKAN software instance. You execute CKAN actions, evaluate their success, return the results of 'action_run' directly as 'results' "
-    "and suggest improvements or appropriate alternatives when as 'comment'.\n\n"
-    # "Before returning the results, try to augment the entities in your answer with links created by 'build_ckan_url', "
-    # "available routs you can get with 'ckan_url_patterns' tool.\n\n"
-
-    "Behavior:\n"
-    "- Attempt to run the specified CKAN action with the given parameters straight away, do not look up the action.\n"
-    "- If the action fails or is invalid:\n"
-    "  - If the action fails because of missing parameters, run the actions again with the default parameters form the documentation.\n"
-    "  - return the results but mentions the corrections you made and what can be improved on next call."
-    "  - Use `get_ckan_action_details` to explain what the suggested action does.\n"
-    "  - when patching datasets (packages) or resources ALWAYS confirm that the changes where applied by running the corresponding _show action again. If it fails suggest the necessarry call updated coresponding to the metadata schema returned by the _show call.\n"
-    "- If your action returns datasets or other CKAN objects, suggest relevant follow-up actions, e.g., "
-    "- **Do not output internal reasoning. Focus only on clean, result-oriented output.**\n\n"
-    "Data Search:\n"
-    "- When searching for datasets, use `package_search` with `include_private=true` to ensure full visibility.\n\n"
+ckan_agent_prompt = h.load_prompt(
+    "ckanext.chat.ckan_agent_prompt_url",
+    "ckan_agent_prompt.txt",
+    extension_dir,
 )
+
 
 agent = Agent(
     model=model,
