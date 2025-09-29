@@ -95,7 +95,7 @@ CKANINI__CKANEXT__CHAT__RAG_PROMPT_FILE_URL="https://link-to-rag-promt-file"
 CKANINI__CKANEXT__CHAT__DOC_PROMPT_FILE_URL="https://link-to-doc-promt-file"
 CKANINI__CKANEXT__CHAT__FRONT_AGENT_PROMPT_URL="https://link-to-front-agent-promt-file"
 CKANINI__CKANEXT__CHAT__RESEARCH_AGENT_PROMPT_URL="https://link-to-research-agent-promt-file"
-CKANINI__CKANEXT__CHAT__CKAN_AGENT_PROMPT_URL="https://link-to-research-agent-promt-file"
+CKANINI__CKANEXT__CHAT__CKAN_AGENT_PROMPT_URL="https://link-to-ckan-agent-promt-file"
 ```
 
 or ckan.ini parameters
@@ -105,7 +105,7 @@ ckanext.chat.rag_prompt_file_url="https://link-to-rag-promt-file"
 ckanext.chat.doc_prompt_file_url="https://link-to-doc-promt-file"
 ckanext.chat.front_agent_prompt_url="https://link-to-front-agent-promt-file"
 ckanext.chat.research_agent_prompt_url="https://link-to-research-agent-promt-file"
-ckanext.chat.ckan_agent_prompt_url="https://link-to-research-agent-promt-file"
+ckanext.chat.ckan_agent_prompt_url="https://link-to-ckan-agent-promt-file"
 ```
 
 ## Timeouts
