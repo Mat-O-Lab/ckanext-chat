@@ -2,20 +2,22 @@ import asyncio
 import json
 import os
 import sys
+import time
 from distutils.util import strtobool
 from typing import Any
 
+import ckan.lib.api_token as api_token
 import ckan.lib.base as base
 import ckan.lib.helpers as core_helpers
 import ckan.plugins.toolkit as toolkit
 from ckan.common import _, current_user
-from flask import Blueprint, current_app, jsonify, request
+from flask import Blueprint, Response, current_app, jsonify, request, stream_with_context
 from flask.views import MethodView
 from loguru import logger
 from pydantic_ai.messages import ModelMessagesTypeAdapter, TextPart
 from pydantic_ai.usage import UsageLimits
 
-from ckanext.chat.bot.agent import (exception_to_model_response,
+from ckanext.chat.bot.agent import (UploadedFile, exception_to_model_response,
                                     user_input_to_model_request)
 from ckanext.chat.helpers import service_available
 
@@ -24,7 +26,7 @@ logger.remove()
 if bool(strtobool(os.environ.get("DEBUG", "false"))):
     log_level = "DEBUG"
 else:
-    log_level = "ERROR"
+    log_level = "INFO"
 logger.add(
     sys.stderr,
     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | [{name}] {message}",
@@ -74,6 +76,36 @@ MAX_MESSAGE_CONTENT_LENGTH = 50000
 VALID_MESSAGE_KINDS = {"request", "response"}
 
 
+def _authenticate_request():
+    """Authenticate via API token header or CKAN session. Returns (user_id, error_response)."""
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header:
+        token = auth_header.removeprefix("Bearer ").strip()
+        if token:
+            user = api_token.get_user_from_token(token)
+            if user:
+                return user.id, None
+        return None, (jsonify({"success": False, "msg": "Invalid API token"}), 401)
+
+    tkuser = toolkit.current_user
+    if tkuser and not tkuser.is_anonymous and tkuser.id:
+        return tkuser.id, None
+
+    return None, (jsonify({"success": False, "msg": "Authentication required"}), 401)
+
+
+def _extract_upload():
+    """Extract uploaded file from request.files, if present."""
+    f = request.files.get("upload")
+    if f and f.filename:
+        return UploadedFile(
+            filename=f.filename,
+            content_type=f.content_type or "application/octet-stream",
+            data=f.read(),
+        )
+    return None
+
+
 def _validate_history(history_str: str):
     if not history_str:
         return None
@@ -104,18 +136,21 @@ def _validate_history(history_str: str):
 
 
 def ask():
+    user_id, auth_error = _authenticate_request()
+    if auth_error:
+        return auth_error
+
     user_input = request.form.get("text")
     history = request.form.get("history", "")
-    research = request.form.get("research", False)
-    tkuser = toolkit.current_user
+    _raw = request.form.get("research", "")
+    research = _raw is True or (isinstance(_raw, str) and _raw.lower() in ("true", "1", "research"))
+    uploaded_file = _extract_upload()
     debug = bool(strtobool(os.environ.get("DEBUG", "false")))
-
-    if tkuser.name is None:
-        return {"success": False, "msg": "Must be logged in to view site"}
 
     try:
         response = asyncio.run(
-            _agent_worker(user_input, history, user_id=tkuser.id, research=research),
+            _agent_worker(user_input, history, user_id=user_id,
+                          research=research, uploaded_file=uploaded_file),
             debug=debug,
         )
         messages = response.new_messages()
@@ -136,11 +171,14 @@ def ask():
         return jsonify({"response": [user_promt, error_response]})
 
 
-async def _agent_worker(prompt: str, history: str, user_id: str, research: bool = False) -> Any:
+async def _agent_worker(prompt: str, history: str, user_id: str,
+                        research: bool = False,
+                        status_queue: 'asyncio.Queue | None' = None,
+                        uploaded_file: 'UploadedFile | None' = None) -> Any:
     from loguru import logger as _logger
     from ckanext.chat.bot.agent import (
         Deps, agent, research_agent,
-        mcp_available, get_user_token, config,
+        mcp_available, get_user_token, config, _push_status,
     )
     from ckanext.chat.bot.utils import init_dynamic_models, dynamic_models_initialized
 
@@ -150,7 +188,7 @@ async def _agent_worker(prompt: str, history: str, user_id: str, research: bool 
     if not dynamic_models_initialized:
         init_dynamic_models()
 
-    deps = Deps(user_id=user_id)
+    deps = Deps(user_id=user_id, status_queue=status_queue, uploaded_file=uploaded_file)
     msg_history = _validate_history(history)
 
     if mcp_available():
@@ -171,10 +209,13 @@ async def _agent_worker(prompt: str, history: str, user_id: str, research: bool 
         log.info("Using ckan_agent fallback path")
 
     active_agent = research_agent if research else agent
+    if research:
+        log.info("Switching from front_agent to research_agent")
+        _push_status(deps, "Switching to research agent (deep research mode)")
     limits = (
-        UsageLimits(request_limit=10, total_tokens_limit=config.MAX_TOKENS_RESEARCH_AGENT)
+        UsageLimits(request_limit=config.REQUEST_LIMIT_RESEARCH_AGENT, total_tokens_limit=config.MAX_TOKENS_RESEARCH_AGENT)
         if research else
-        UsageLimits(request_limit=6, total_tokens_limit=config.MAX_TOKENS_FRONT_AGENT)
+        UsageLimits(request_limit=config.REQUEST_LIMIT_FRONT_AGENT, total_tokens_limit=config.MAX_TOKENS_FRONT_AGENT)
     )
 
     r = await active_agent.run(
@@ -189,15 +230,130 @@ async def _agent_worker(prompt: str, history: str, user_id: str, research: bool 
     return r
 
 
+async def _stream_with_status(prompt, history, user_id, research=False,
+                              uploaded_file=None):
+    status_queue = asyncio.Queue()
+    result_queue = asyncio.Queue()
+
+    async def _worker():
+        try:
+            r = await _agent_worker(prompt, history, user_id, research,
+                                    status_queue=status_queue,
+                                    uploaded_file=uploaded_file)
+            await result_queue.put(('result', r))
+        except Exception as e:
+            await result_queue.put(('error', e))
+        finally:
+            await status_queue.put(None)
+
+    task = asyncio.create_task(_worker())
+
+    _KEEPALIVE_INTERVAL = 15
+    last_yield_time = time.monotonic()
+    running = True
+    while running:
+        yielded = False
+        try:
+            status = await asyncio.wait_for(status_queue.get(), timeout=0.2)
+            if status is None:
+                running = False
+            else:
+                yield ('status', status)
+                yielded = True
+        except asyncio.TimeoutError:
+            if task.done():
+                running = False
+
+        if yielded:
+            last_yield_time = time.monotonic()
+        elif time.monotonic() - last_yield_time >= _KEEPALIVE_INTERVAL:
+            last_yield_time = time.monotonic()
+            yield ('keepalive', None)
+
+    while not status_queue.empty():
+        try:
+            s = status_queue.get_nowait()
+            if s is not None:
+                yield ('status', s)
+        except asyncio.QueueEmpty:
+            break
+
+    await task
+
+    result_type, result_value = await result_queue.get()
+    yield (result_type, result_value)
+
+
+def ask_stream():
+    user_id, auth_error = _authenticate_request()
+    if auth_error:
+        return auth_error
+
+    user_input = request.form.get("text")
+    history = request.form.get("history", "")
+    _raw = request.form.get("research", "")
+    research = _raw is True or (isinstance(_raw, str) and _raw.lower() in ("true", "1", "research"))
+    uploaded_file = _extract_upload()
+
+    def generate():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            gen = _stream_with_status(user_input, history, user_id, research,
+                                      uploaded_file=uploaded_file)
+            ait = gen.__aiter__()
+            while True:
+                try:
+                    event_type, value = loop.run_until_complete(ait.__anext__())
+                except StopAsyncIteration:
+                    break
+
+                if event_type == 'keepalive':
+                    yield ": keepalive\n\n"
+                elif event_type == 'status':
+                    yield f"event: status\ndata: {json.dumps({'message': value})}\n\n"
+                elif event_type == 'result':
+                    messages = value.new_messages()
+                    for message in messages:
+                        message.parts[:] = [
+                            p for p in message.parts
+                            if not (isinstance(p, TextPart) and p.content == "")
+                        ]
+                    serialized = ModelMessagesTypeAdapter.dump_python(messages, mode='json')
+                    yield f"event: done\ndata: {json.dumps({'response': serialized})}\n\n"
+                elif event_type == 'error':
+                    logger.error(f"ask_stream agent error: {value}")
+                    user_prompt = user_input_to_model_request(user_input)
+                    error_response = exception_to_model_response(value)
+                    serialized = ModelMessagesTypeAdapter.dump_python(
+                        [user_prompt, error_response], mode='json'
+                    )
+                    yield f"event: done\ndata: {json.dumps({'response': serialized})}\n\n"
+        finally:
+            loop.close()
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
 
 blueprint.add_url_rule(
     "/chat",
     view_func=ChatView.as_view(str("chat")),
+    strict_slashes=False,
 )
 
 blueprint.add_url_rule(
     "/chat/ask",
     view_func=ask,
+    methods=["POST"],
+)
+
+blueprint.add_url_rule(
+    "/chat/ask/stream",
+    view_func=ask_stream,
     methods=["POST"],
 )
 

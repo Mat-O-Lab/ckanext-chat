@@ -35,6 +35,7 @@ class ChatPlugin(plugins.SingletonPlugin, DefaultTranslation):
         declaration.declare(group.embedding_model, "text-embedding-3-small")
         declaration.declare(group.embedding_api, "")
         declaration.declare(group.milvus_url, "")
+        declaration.declare(group.milvus_token, "")
         declaration.declare(group.collection_name, "")
         declaration.declare(group.provider, "azure")
         declaration.declare(group.model_name, "")
@@ -42,6 +43,15 @@ class ChatPlugin(plugins.SingletonPlugin, DefaultTranslation):
         declaration.declare(group.base_url, "")
         declaration.declare(group.api_key, "")
         declaration.declare(group.api_version, "2024-06-01")
+        declaration.declare_int(group.embedding_timeout, 15)
+        declaration.declare(
+            group.agent_bypass_actions,
+            "organization_list,organization_show,group_list,group_show,tag_list,user_show,resource_show,package_show,package_search,package_list"
+        )
+        declaration.declare(
+            group.agent_required_suffixes,
+            "_create,_patch"
+        )
 
     # IBlueprint
 

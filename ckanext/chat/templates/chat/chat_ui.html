@@ -80,21 +80,31 @@ breadcrumb_content %}
 
             {% endblock %}
           </div>
-          <a
-            class="btn btn-primary"
-            aria-label="Send prompt"
-            data-testid="send-button"
-            id="sendButton"
-            onclick="sendMessage(this)"
-          >
-            <i class="fa fa-paper-plane"></i>
-            <span
-              class="spinner-border spinner-border-sm d-none"
-              role="status"
-              aria-hidden="true"
-            ></span>
-            <span class="button-text">{% trans %}Send{% endtrans %}</span>
-          </a>
+          <div class="d-flex gap-2">
+            <a
+              class="btn btn-danger d-none"
+              aria-label="Stop generation"
+              id="abortButton"
+            >
+              <i class="fa fa-stop"></i>
+              <span class="button-text">{% trans %}Stop{% endtrans %}</span>
+            </a>
+            <a
+              class="btn btn-primary"
+              aria-label="Send prompt"
+              data-testid="send-button"
+              id="sendButton"
+              onclick="sendMessage(this)"
+            >
+              <i class="fa fa-paper-plane"></i>
+              <span
+                class="spinner-border spinner-border-sm d-none"
+                role="status"
+                aria-hidden="true"
+              ></span>
+              <span class="button-text">{% trans %}Send{% endtrans %}</span>
+            </a>
+          </div>
         </div>
       </div>
     </section>

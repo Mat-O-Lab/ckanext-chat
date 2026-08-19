@@ -17,6 +17,9 @@ api_blueprint = Blueprint("chat_api", __name__)
 
 log = logger.bind(module=__name__)
 
+_SSE_KEEPALIVE = "\x00keepalive"
+_KEEPALIVE_INTERVAL = 15
+
 
 @api_blueprint.before_request
 def _capture_app():
@@ -111,10 +114,12 @@ def _setup_agent_run(user_id: str, history_parts: list, research: bool):
             msg_history = None
 
     active_agent = research_agent if research else agent
+    if research:
+        log.info("Switching from front_agent to research_agent")
     limits = (
-        UsageLimits(request_limit=10, total_tokens_limit=config.MAX_TOKENS_RESEARCH_AGENT)
+        UsageLimits(request_limit=config.REQUEST_LIMIT_RESEARCH_AGENT, total_tokens_limit=config.MAX_TOKENS_RESEARCH_AGENT)
         if research else
-        UsageLimits(request_limit=6, total_tokens_limit=config.MAX_TOKENS_FRONT_AGENT)
+        UsageLimits(request_limit=config.REQUEST_LIMIT_FRONT_AGENT, total_tokens_limit=config.MAX_TOKENS_FRONT_AGENT)
     )
     return active_agent, deps, msg_history, limits
 
@@ -131,14 +136,91 @@ async def _run_agent_for_api(prompt: str, history_parts: list, user_id: str, res
 
 async def _run_agent_stream(prompt: str, history_parts: list, user_id: str, research: bool = False):
     active_agent, deps, msg_history, limits = _setup_agent_run(user_id, history_parts, research)
-    async with active_agent.run_stream(
-        user_prompt=prompt,
-        message_history=msg_history,
-        deps=deps,
-        usage_limits=limits,
-    ) as stream:
-        async for chunk in stream.stream_text(delta=True):
-            yield chunk
+
+    status_queue = asyncio.Queue()
+    deps.status_queue = status_queue
+    if research:
+        status_queue.put_nowait("Switching to research agent (deep research mode)")
+    output_queue = asyncio.Queue()
+
+    t0 = time.monotonic()
+    last_yield_time = t0
+    first_chunk = True
+    chunk_count = 0
+
+    async def _agent_worker():
+        try:
+            if research:
+                # Research agent does many multi-turn tool calls; run_stream()
+                # + stream_text() ends prematurely after the first model
+                # response text. Use run() (like /chat/ask/stream) instead.
+                result = await active_agent.run(
+                    user_prompt=prompt,
+                    message_history=msg_history,
+                    deps=deps,
+                    usage_limits=limits,
+                )
+                text = result.output if hasattr(result, "output") else str(result)
+                await output_queue.put(text)
+            else:
+                async with active_agent.run_stream(
+                    user_prompt=prompt,
+                    message_history=msg_history,
+                    deps=deps,
+                    usage_limits=limits,
+                ) as stream:
+                    async for chunk in stream.stream_text(delta=True):
+                        await output_queue.put(chunk)
+        except Exception as e:
+            log.error(f"agent_worker error: {type(e).__name__}: {str(e)[:500]}")
+            await output_queue.put(f"\n\n**Fehler:** {type(e).__name__}: {str(e)}")
+        finally:
+            await output_queue.put(None)
+
+    task = asyncio.create_task(_agent_worker())
+
+    def _drain_status():
+        chunks = []
+        while not status_queue.empty():
+            try:
+                chunks.append(status_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return chunks
+
+    running = True
+    while running:
+        yielded = False
+        for status in _drain_status():
+            yield f"[status]{status}[/status]\n"
+            yielded = True
+
+        try:
+            chunk = await asyncio.wait_for(output_queue.get(), timeout=0.2)
+            if chunk is None:
+                running = False
+            else:
+                chunk_count += 1
+                if first_chunk:
+                    log.info(f"stream first-chunk after {time.monotonic() - t0:.1f}s")
+                    first_chunk = False
+                yield chunk
+                yielded = True
+        except asyncio.TimeoutError:
+            if task.done():
+                running = False
+
+        if yielded:
+            last_yield_time = time.monotonic()
+        elif time.monotonic() - last_yield_time >= _KEEPALIVE_INTERVAL:
+            last_yield_time = time.monotonic()
+            yield _SSE_KEEPALIVE
+
+    for status in _drain_status():
+        yield f"[status]{status}[/status]\n"
+
+    await task
+    log.info(f"stream finished: {chunk_count} chunks in {time.monotonic() - t0:.1f}s")
 
 
 @api_blueprint.route("/chat/v1/chat/completions", methods=["POST"])
@@ -223,6 +305,10 @@ def _handle_stream(prompt, history_parts, user, research, completion_id, created
                     except StopAsyncIteration:
                         break
 
+                    if chunk_text == _SSE_KEEPALIVE:
+                        yield ": keepalive\n\n"
+                        continue
+
                     chunk = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -255,13 +341,32 @@ def _handle_stream(prompt, history_parts, user, research, completion_id, created
 
         except Exception as e:
             log.error(f"chat_completions stream error: {type(e).__name__}: {str(e)[:200]}")
+            error_msg = f"Stream error: {type(e).__name__}: {str(e)}"
             error_chunk = {
-                "error": {
-                    "message": f"Stream error: {type(e).__name__}: {str(e)}",
-                    "type": "server_error",
-                }
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_hint,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": f"\n\n**Fehler:** {error_msg}"},
+                    "finish_reason": None,
+                }],
             }
             yield f"data: {json.dumps(error_chunk)}\n\n"
+            final_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_hint,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }],
+            }
+            yield f"data: {json.dumps(final_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
 
     return Response(
         stream_with_context(generate()),

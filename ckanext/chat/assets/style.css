@@ -195,3 +195,18 @@ pre {
 .tool-call:hover {
   z-index: 20;
 }
+
+.status-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.status-line {
+  opacity: 0.5;
+}
+.status-line.active {
+  opacity: 1;
+}
+.status-line .fa-check {
+  color: var(--bs-success);
+}

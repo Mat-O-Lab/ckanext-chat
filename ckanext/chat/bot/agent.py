@@ -50,8 +50,8 @@ class AgentConfig:
     """Centralized configuration for agent timeouts, limits, and retries"""
     # Timeout settings (in seconds)
     CKAN_RUN_TIMEOUT: int = 90
-    LITERATURE_SEARCH_TIMEOUT: int = 30
-    LITERATURE_ANALYSE_TIMEOUT: int = 120
+    LITERATURE_SEARCH_TIMEOUT: int = 90
+    LITERATURE_ANALYSE_TIMEOUT: int = 180
     
     # Token limits
     MAX_TOKENS_RAG_MODEL: int = 16384
@@ -71,8 +71,8 @@ class AgentConfig:
     REQUEST_LIMIT_CKAN_RUN: int = 25
     REQUEST_LIMIT_LITERATURE_SEARCH: int = 10
     REQUEST_LIMIT_LITERATURE_ANALYSE: int = 50
-    REQUEST_LIMIT_FRONT_AGENT: int = 6
-    REQUEST_LIMIT_RESEARCH_AGENT: int = 10
+    REQUEST_LIMIT_FRONT_AGENT: int = 10
+    REQUEST_LIMIT_RESEARCH_AGENT: int = 50
     
     # Response truncation settings
     SMART_TRUNCATE_MAX_TOKENS: int = 8000
@@ -132,6 +132,7 @@ think_model = build_model(think_model_name)
 # --------------------- Milvus and CKAN Setup ---------------------
 
 milvus_url = toolkit.config.get("ckanext.chat.milvus_url", "")
+milvus_token = toolkit.config.get("ckanext.chat.milvus_token", "")
 collection_name = toolkit.config.get("ckanext.chat.collection_name", "")
 embedding_model = toolkit.config.get(
     "ckanext.chat.embedding_model", "text-embedding-3-small"
@@ -140,24 +141,32 @@ embedding_api = toolkit.config.get("ckanext.chat.embedding_api", "")
 
 vector_dim = None
 if milvus_url:
-    milvus_client = MilvusClient(uri=milvus_url)
+    try:
+        milvus_client = MilvusClient(uri=milvus_url, token=milvus_token) if milvus_token else MilvusClient(uri=milvus_url)
+    except Exception as e:
+        log.warning(f"Milvus connection failed: {e}")
+        milvus_client = None
     if milvus_client:
-        collection_info = milvus_client.describe_collection(
-            collection_name=collection_name
-        )
-        vector_field = None
-        for entry in collection_info["fields"]:
-            if "params" in entry.keys() and "dim" in entry["params"].keys():
-                vector_field = entry
-                break
-        if vector_field:
-            vector_dim = vector_field["params"]["dim"]
-            field_name = vector_field["name"]
-            log.debug(f"Found vector field: {field_name}")
-            log.debug(f"Vector dimension is: {vector_dim}")
-        else:
+        try:
+            collection_info = milvus_client.describe_collection(
+                collection_name=collection_name
+            )
+            vector_field = None
+            for entry in collection_info["fields"]:
+                if "params" in entry.keys() and "dim" in entry["params"].keys():
+                    vector_field = entry
+                    break
+            if vector_field:
+                vector_dim = vector_field["params"]["dim"]
+                field_name = vector_field["name"]
+                log.debug(f"Found vector field: {field_name}")
+                log.debug(f"Vector dimension is: {vector_dim}")
+            else:
+                vector_dim = None
+                log.debug("No vector field found in the collection schema.")
+        except Exception as e:
+            log.warning(f"Milvus collection lookup failed: {e}")
             vector_dim = None
-            log.debug("No vector field found in the collection schema.")
     else:
         log.debug("Milvus client not initialized.")
 else:
@@ -184,6 +193,13 @@ def get_http_session() -> aiohttp.ClientSession:
     return _global_http_session
 
 @dataclass
+class UploadedFile:
+    filename: str
+    content_type: str
+    data: bytes
+
+
+@dataclass
 class Deps:
     user_id: str
     milvus_client: MilvusClient = field(default_factory=lambda: milvus_client)
@@ -196,7 +212,40 @@ class Deps:
     collection_name: str = collection_name
     vector_dim: int = vector_dim
     http_session: aiohttp.ClientSession = field(default_factory=get_http_session)
-    #file: Optional[TextResource] = None
+    status_queue: Optional[asyncio.Queue] = None
+    uploaded_file: Optional[UploadedFile] = None
+
+
+def _push_status(deps, message: str):
+    if deps.status_queue is not None:
+        try:
+            deps.status_queue.put_nowait(message)
+        except Exception:
+            pass
+
+
+def _format_params_short(parameters: dict, max_len: int = 80) -> str:
+    """Format parameters compactly for status messages and logs."""
+    if not parameters:
+        return ""
+    priority_keys = ['q', 'fq', 'id', 'name']
+    parts = []
+    for key in priority_keys:
+        if key in parameters:
+            val = str(parameters[key])
+            if len(val) > 60:
+                val = val[:57] + "..."
+            parts.append(f"{key}={val}")
+    if not parts:
+        key, val = next(iter(parameters.items()))
+        val = str(val)
+        if len(val) > 60:
+            val = val[:57] + "..."
+        parts.append(f"{key}={val}")
+    result = ", ".join(parts)
+    if len(result) > max_len:
+        result = result[:max_len - 3] + "..."
+    return result
 
 @dataclass
 class StringSlice:
@@ -414,159 +463,203 @@ doc_prompt = (
 
 # --------------------- Updated Front Agent ---------------------
 front_agent_prompt = (
-    "You coordinate user requests by delegating to specialized tools efficiently.\n\n"
-    
-    "DECISION TREE:\n"
-    "1. Analyze user question type:\n"
-    "   - CKAN operation (search, list, create, update, show) → use ckan_run\n"
-    "   - General knowledge/literature → use literature_search\n"
-    "   - Document analysis (specific file) → use literature_analyse\n"
-    "   - Mixed query → literature_search first, then ckan_run if needed\n\n"
+    "You coordinate user requests by delegating to specialized tools efficiently.\n"
+    "Answer in the same language as the user.\n\n"
 
-    "2. Execute efficiently:\n"
-    "   - Maximum 3 tool calls per response (e.g., search + analyze + ckan)\n"
-    "   - Prefer single comprehensive call over multiple small ones\n"
-    "   - Only call tools when necessary\n\n"
+    "EXECUTION BEHAVIOR (CRITICAL — read this first):\n"
+    "- When the user asks to create, update, upload, or modify data, EXECUTE IMMEDIATELY.\n"
+    "- Do NOT ask for confirmation — the user's instruction IS the confirmation.\n"
+    "- Do NOT list what you will do and ask 'shall I proceed?' — just do it.\n"
+    "- Do NOT ask for metadata (title, description, tags, author) — extract them yourself from the document context.\n"
+    "- Only ask ONE question if BOTH organization AND visibility are missing. Never ask more than one question total.\n"
+    "- After execution, report what was done (dataset URL, resource URL, key metadata used).\n\n"
 
-    "TOOL USAGE GUIDELINES:\n\n"
+    "UPLOADED FILE HANDLING (CRITICAL):\n"
+    "- When the user uploads a document, its text content is ALREADY in your context as document chunks.\n"
+    "- Extract title, authors, description, and tags directly from these chunks — no tool calls needed for metadata extraction.\n"
+    "- Do NOT call literature_analyse or get_resource_file_contents on uploaded documents — their content is already available to you.\n"
+    "- literature_analyse is ONLY for analyzing existing CKAN resources that have valid CKAN download URLs (starting with http).\n"
+    "- For resource_create, the uploaded file is AUTOMATICALLY attached by the system. Just provide package_id, name, and format.\n\n"
 
-    "**CKAN OPERATIONS (read AND write):**\n"
-    "Use ckan_run for ALL CKAN operations: search, show, list, create, update, patch.\n"
-    "It handles action validation, parameter optimization, and MCP integration automatically.\n"
-    "You CAN create organizations, datasets, resources, and update/patch them via ckan_run.\n"
+    "DOCUMENT UPLOAD WORKFLOW:\n"
+    "When the user asks to upload/integrate a document into CKAN, execute these steps WITHOUT asking questions:\n\n"
+    "Step 1 — Auto-extract metadata from the document chunks in your context:\n"
+    "  - title: extract from document content (chapter title, paper title, or filename)\n"
+    "  - author: extract author names from document content (look for author sections, affiliations, email addresses)\n"
+    "  - notes: write a 2-3 sentence summary based on the document content\n"
+    "  - tags: generate 3-6 relevant tags from the document's key topics\n"
+    "  - name (slug): auto-generate from title (lowercase, hyphens, no special chars, no umlauts)\n"
+    "  - Use the SAME title for both the dataset and the resource\n"
+    "  - If the user provides any of these explicitly, use their values instead\n\n"
+    "Step 2 — Resolve organization (only if user specified one):\n"
+    "  - Call ckan_run('organization_list', {}) to get all orgs\n"
+    "  - Match user's input against org names/titles (fuzzy match OK)\n"
+    "  - If exactly one match: use it. If ambiguous: ask user to pick.\n"
+    "  - If user did NOT specify an org: ask which org to use (this is the ONLY allowed question).\n\n"
+    "Step 3 — Create dataset:\n"
+    "  - Call ckan_run('package_create', {title, name, notes, author, owner_org, private, tags: [{name: tag}, ...]})\n"
+    "  - private defaults to True if user said 'privat'/'private', False if 'public'/'öffentlich'\n"
+    "  - If user did not specify visibility AND org: ask ONCE for both, then execute.\n\n"
+    "Step 4 — Create resource:\n"
+    "  - Call ckan_run('resource_create', {package_id: <id from step 3>, name: <filename>, format: <extension>})\n"
+    "  - The uploaded file bytes are AUTOMATICALLY injected — do NOT try to download or reference the file.\n\n"
+    "Step 5 — Report result:\n"
+    "  - Show: dataset title, URL, organization, visibility, tags, author\n"
+    "  - Show: resource name and format\n\n"
+
+    "QUICK SEARCH (for information/knowledge queries):\n"
+    "When the user asks a question that seeks information or knowledge, execute these two steps:\n\n"
+
+    "Step 1 — LITERATURE SEARCH:\n"
+    "- Call literature_search with the user's question rephrased for semantic matching\n"
+    "- Note all returned citations and sources\n\n"
+
+    "Step 2 — PACKAGE SEARCH:\n"
+    "- Derive 2-4 keywords from the user's question\n"
+    "- Call ckan_run('package_search', {'q': '<keywords>', 'include_private': True})\n"
+    "- Review the returned datasets and their metadata\n"
+    "- If a highly relevant dataset has PDF or Markdown resources, optionally call literature_analyse on the single best one\n\n"
+
+    "After both steps, synthesize findings into a clear answer.\n"
+    "Do NOT perform group discovery or tag discovery — keep it fast (max ~3-5 tool calls).\n\n"
+
+    "EXCEPTION — QUICK SEARCH does NOT apply to:\n"
+    "- Create/update/upload/patch operations → use DOCUMENT UPLOAD WORKFLOW or direct ckan_run\n"
+    "- Requests to show a specific known dataset/resource → use ckan_run('package_show'/'resource_show') directly\n"
+    "- Pure administrative queries (list orgs, show user) → use ckan_run directly\n\n"
+
+    "CKAN OPERATIONS:\n"
+    "Use ckan_run for ALL CKAN operations. It handles validation and MCP integration automatically.\n"
+    "You CAN create organizations, datasets, resources, and update/patch them.\n"
     "Only delete and purge operations are blocked.\n\n"
 
-    "CRITICAL RULES for CKAN queries:\n"
-    "1. For dataset LISTING/SEARCH, use package_search (not package_list).\n"
-    "   - package_search returns full metadata and supports private datasets.\n"
-    "   - package_list only returns names.\n"
-    "2. ALWAYS include 'include_private': True for package_search.\n"
-    "3. Search patterns:\n"
-    "   - All datasets: q='*:*', include_private=True\n"
-    "   - By tag: q='tags:TAG_NAME', include_private=True\n"
-    "   - By keyword: q='KEYWORD', include_private=True\n"
-    "   - By organization: q='owner_org:ORG_ID', include_private=True\n"
-    "     OR: q='*:*', fq='owner_org:ORG_ID', include_private=True\n"
-    "4. For specific dataset details: use package_show with id=DATASET_ID_OR_NAME.\n"
-    "5. For specific resource details: use resource_show with id=RESOURCE_ID.\n"
-    "   Do NOT use package_search to look up a resource by ID.\n"
-    "6. NEVER execute delete or purge operations.\n\n"
-    
-    "**literature_search:**\n"
-    "- ALWAYS rephrase user query for better semantic matching\n"
-    "- Returns LitSearchResult with sources and citations\n"
-    "- If results insufficient: try ONE more time with broader query\n"
-    "- Use returned similarity scores to rank relevance\n\n"
-    
-    "**literature_analyse:**\n"
-    "- Only when detailed document analysis needed\n"
-    "- Returns text_slices with highlight URLs\n"
-    "- Each URL format: /highlight/<start>/<end>\n"
-    "- NEVER modify returned URLs\n\n"
-    
+    "CKAN QUERY RULES:\n"
+    "- Use package_search (not package_list) for listing/searching datasets\n"
+    "- ALWAYS include 'include_private': True for package_search\n"
+    "- All datasets: q='*:*', include_private=True\n"
+    "- By organization: fq='owner_org:ORG_ID', include_private=True\n"
+    "- For specific dataset: package_show with id=DATASET_ID_OR_NAME\n"
+    "- For specific resource: resource_show with id=RESOURCE_ID\n"
+    "- NEVER execute delete or purge operations\n\n"
+
+    "literature_search: rephrase user query for semantic matching. Max 2 attempts.\n"
+    "literature_analyse: ONLY for analyzing existing CKAN resources with valid http(s) download URLs. Never for uploaded files.\n\n"
+
     "RESPONSE FORMAT:\n"
-    "- Write clear, direct answer synthesizing tool results\n"
-    "- Citations: [Author Year](url) - NO numbered refs like [1]\n"
-    "- Math: use $$ delimiters\n"
-    "- Include 2-3 follow-up suggestions\n"
-    "- For CKAN results: include view_urls when available\n\n"
-    
+    "- Clear, direct answer synthesizing all tool results\n"
+    "- Citations: [Author Year](dataset_url) — no numbered refs\n"
+    "- For CKAN results: include dataset URLs when available\n"
+    "- URL RULE: Always truncate resource/download URLs to the dataset URL.\n"
+    "  Example: .../dataset/9fee1eac-.../resource/73f3aa3f-.../download/file.md → .../dataset/9fee1eac-...\n"
+    "  Cut everything after /dataset/<dataset_id>. This lets users access all resources including PDFs.\n\n"
+
     "ERROR HANDLING:\n"
     "- Tool fails → interpret error, modify params, retry ONCE\n"
-    "- Still fails → explain to user and ask for guidance\n"
+    "- Still fails → report what you found, note the gap\n"
     "- Never fabricate data or URLs\n\n"
-    
-    "CKAN STRUCTURE:\n"
-    "- Packages (datasets) contain Resources (files/links)\n"
-    "- Packages belong to Organizations\n"
-    "- Packages can be in multiple Groups\n"
-    "- Resources have Views based on format\n\n"
-    
-    "EFFICIENCY RULES:\n"
-    "- Don't call get_ckan_action_names every time - only when uncertain\n"
-    "- Combine operations when possible\n"
-    "- Stop when sufficient information gathered\n"
-    "- Aim for 1-3 tool calls total\n\n"
-    
+
     "IMPORTANT:\n"
-    "- Maximum 3 tool calls per user query\n"
+    "- Keep information queries fast — max ~3-5 tool calls\n"
     "- Quality over quantity\n"
-    "- Never change data from tools, especially URLs\n"
-    "- Always verify, never assume\n"
+    "- Never change data from tools, except truncating resource URLs to dataset URLs as described above\n"
 )
 
 research_agent_prompt = (
-    "You conduct deep research by systematically exploring literature and synthesizing findings.\n\n"
-    
-    "RESEARCH PROCESS (5 Phases):\n\n"
-    
-    "Phase 1: ANALYZE (no tools, 30 seconds thinking)\n"
+    "You conduct deep research by systematically exploring ALL available data sources — literature, CKAN packages, groups, and tags — then synthesize findings.\n"
+    "Answer in the same language as the user.\n\n"
+
+    "RESEARCH PROCESS (7 Phases):\n\n"
+
+    "Phase 1: ANALYZE (no tools)\n"
     "- Break down the question into 2-3 key aspects\n"
     "- Formulate 1-2 testable hypotheses\n"
     "- Identify core concepts and technical terms\n"
-    "- Plan search strategy\n\n"
-    
-    "Phase 2: SEARCH (2-3 searches max)\n"
-    "- literature_search with rephrased query for each hypothesis\n"
-    "- ALWAYS rephrase user question for better semantic matching\n"
+    "- Plan search strategy across all data sources\n\n"
+
+    "Phase 2: LITERATURE SEARCH (Milvus vector DB — 2-3 searches max)\n"
+    "- Call literature_search with rephrased query for each key aspect/hypothesis\n"
+    "- ALWAYS rephrase the user question for better semantic matching\n"
     "- If first search insufficient, broaden query and retry ONCE\n"
     "- Target: 5-7 distinct high-quality sources\n"
-    "- Maximum 3 search operations total\n\n"
-    
-    "Phase 3: ANALYZE DOCUMENTS (3-5 analyses max)\n"
-    "- literature_analyse top 3-5 most relevant sources\n"
-    "- Extract precise passages with highlight URLs\n"
-    "- Note key findings from each source\n"
+    "- Maximum 3 literature_search calls\n\n"
+
+    "Phase 3: PACKAGE SEARCH (keyword-based metadata search)\n"
+    "- Derive 2-4 keywords from the user's question\n"
+    "- Call ckan_run('package_search', {'q': '<keywords>', 'include_private': True})\n"
+    "- Review the returned datasets and their metadata\n"
+    "- For the top 1-3 most relevant datasets, examine their resources:\n"
+    "  - Prefer PDF or Markdown resources; skip if neither exists\n"
+    "  - Call literature_analyse(doc=<resource_url>, question=<user_question>) to read the content\n\n"
+
+    "Phase 4: GROUP DISCOVERY\n"
+    "- Call ckan_run('group_list', {'all_fields': True}) to list all groups\n"
+    "- Identify 1-3 groups most likely to contain relevant datasets for the user's query\n"
+    "- For each relevant group, call ckan_run('package_search', {'fq': 'groups:<group_name>', 'include_private': True})\n"
+    "- For the most relevant datasets found, examine resources (prefer PDF/Markdown) via literature_analyse\n\n"
+
+    "Phase 5: TAG DISCOVERY\n"
+    "- Call ckan_run('tag_list', {'all_fields': True}) to list all tags\n"
+    "- Identify 3-5 tags most relevant to the user's query\n"
+    "- For each relevant tag, call ckan_run('package_search', {'fq': 'tags:<tag_name>', 'include_private': True})\n"
+    "- For the most relevant datasets found, examine resources (prefer PDF/Markdown) via literature_analyse\n\n"
+
+    "Phase 6: DEEP DOCUMENT ANALYSIS (3-5 analyses max)\n"
+    "- Select the top 3-5 most relevant sources found across ALL previous phases\n"
+    "- Call literature_analyse on each to extract precise passages with highlight URLs\n"
     "- Cross-verify quantitative claims across sources\n"
-    "- Maximum 5 document analyses\n\n"
-    
-    "Phase 4: SYNTHESIZE (no tools)\n"
+    "- Skip documents already analyzed in Phases 3-5\n"
+    "- Maximum 5 literature_analyse calls total (including those in Phases 3-5)\n\n"
+
+    "Phase 7: SYNTHESIZE & REPORT (no tools)\n"
     "- Validate/refute initial hypotheses\n"
     "- Identify consensus vs contradictions\n"
     "- Note confidence level for each finding\n"
-    "- Prepare structured report\n\n"
-    
-    "Phase 5: REPORT (structured output)\n"
     "Format:\n"
     "1. Executive Summary (2-3 sentences)\n"
     "2. Key Findings (2-4 subsections)\n"
     "   2.1 [Topic]: Finding + [Evidence](url)\n"
     "   2.2 [Topic]: Finding + [Evidence](url)\n"
-    "3. Evidence Summary (list all sources)\n"
+    "3. Evidence Summary (list all sources with origin: Literatur/Paketsuche/Gruppe/Tag)\n"
     "4. Next Steps (2-3 suggestions)\n\n"
-    
-    "STRICT LIMITS:\n"
-    "- Maximum 10 tool calls total (3 searches + 5 analyses + 2 CKAN)\n"
-    "- Stop when 5+ quality sources analyzed\n"
-    "- If insufficient results after limits, report what was found\n\n"
-    
-    "TOOL USAGE:\n"
-    "**literature_search:** Rephrase query, max 3 calls\n"
-    "**literature_analyse:** Extract precise evidence, max 5 calls\n"
-    "**CKAN data:** Use ckan_run for CKAN queries. It handles MCP integration automatically. Max 2 calls.\n"
-    "  Always use package_search (not package_list), always include_private=True.\n\n"
-    
+
+    "Deduplicate — the same dataset may appear in multiple phases; mention it once with all relevant context.\n\n"
+
+    "TOOL USAGE BUDGET:\n"
+    "- literature_search: max 3 calls\n"
+    "- literature_analyse: max 5 calls total across all phases\n"
+    "- ckan_run: as needed for package_search, group_list, tag_list (typically 5-10 calls)\n"
+    "- Total tool calls: aim for 15-25, hard ceiling at 40\n\n"
+
+    "CKAN QUERY RULES:\n"
+    "- Use package_search (not package_list) for listing/searching datasets\n"
+    "- ALWAYS include 'include_private': True for package_search\n"
+    "- All datasets: q='*:*', include_private=True\n"
+    "- By organization: fq='owner_org:ORG_ID', include_private=True\n\n"
+
     "CITATION FORMAT:\n"
-    "- Inline: [Author Year](highlight_url)\n"
+    "- Inline: [Author Year](dataset_url)\n"
     "- NO numbered references [1] or [^1^]\n"
     "- Every claim must cite source\n"
-    "- Use /highlight/<start>/<end> URLs from literature_analyse\n\n"
-    
+    "- URL RULE: Always truncate resource/download URLs to the dataset URL.\n"
+    "  Example: .../dataset/9fee1eac-.../resource/73f3aa3f-.../download/file.md → .../dataset/9fee1eac-...\n"
+    "  Cut everything after /dataset/<dataset_id>. This lets users access all resources including PDFs.\n\n"
+
     "QUALITY STANDARDS:\n"
     "- 5+ distinct sources minimum\n"
     "- Cross-verify quantitative data\n"
     "- Note contradictions explicitly\n"
     "- Evidence-based only, no assumptions\n"
-    "- Never modify returned URLs\n\n"
-    
+    "- Never modify returned URLs, except truncating resource URLs to dataset URLs as described above\n\n"
+
     "ERROR HANDLING:\n"
     "- Tool fails → interpret error, modify params, retry ONCE\n"
-    "- Still fails → note in report, continue with available data\n\n"
-    
+    "- Still fails → note in report, continue with available data\n"
+    "- If a phase yields no results, proceed to the next phase\n\n"
+
     "IMPORTANT:\n"
+    "- ALL 7 phases are mandatory — do not skip group or tag discovery\n"
     "- Think strategically before each tool call\n"
     "- Quality over quantity\n"
-    "- Stay within 10 tool call budget\n"
     "- Complete research even if some sources unavailable\n"
 )
 # --------------------- System Prompt & Agent ---------------------
@@ -822,6 +915,54 @@ async def _mcp_fetch_data(url: str, token: str, action: str, params: dict) -> Op
         return None
 
 
+def _bypass_ckan_agent(command: str) -> bool:
+    raw_suffixes = toolkit.config.get("ckanext.chat.agent_required_suffixes", "_create,_patch")
+    required_suffixes = tuple(s.strip() for s in raw_suffixes.split(",") if s.strip())
+    if any(command.endswith(s) for s in required_suffixes):
+        return False
+    raw_bypass = toolkit.config.get("ckanext.chat.agent_bypass_actions", "")
+    bypass_set = {a.strip() for a in raw_bypass.split(",") if a.strip()}
+    return command in bypass_set
+
+
+async def _ckan_fetch_data(deps, action: str, params: dict):
+    """Execute a CKAN action via MCP (if available) or direct toolkit call."""
+    response = None
+    fetch_method = "direct"
+
+    if deps.mcp_url and deps.mcp_token:
+        response = await _mcp_fetch_data(
+            deps.mcp_url, deps.mcp_token, action, params,
+        )
+        if response is not None:
+            fetch_method = "mcp"
+
+    if response is None:
+        user = CKANmodel.User.get(user_reference=deps.user_id)
+        context = {
+            "user": user.name,
+            "auth_user_obj": user,
+            "model": CKANmodel,
+            "session": CKANmodel.Session,
+            "ignore_auth": False,
+        }
+        if action in ("resource_create", "resource_patch") and deps.uploaded_file:
+            import io
+            from werkzeug.datastructures import FileStorage
+            uf = deps.uploaded_file
+            params["upload"] = FileStorage(
+                stream=io.BytesIO(uf.data),
+                filename=uf.filename,
+                content_type=uf.content_type,
+            )
+            if not params.get("url"):
+                params["url"] = uf.filename
+            log.info(f"Injected uploaded file '{uf.filename}' into {action}")
+        response = toolkit.get_action(action)(context, params)
+
+    return response, fetch_method
+
+
 @agent.tool
 @research_agent.tool
 async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> str:
@@ -844,9 +985,58 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
     # Normalize parameters to handle JSON boolean/null conversions
     parameters = normalize_parameters(parameters)
 
+    params_short = _format_params_short(parameters)
+    _push_status(ctx.deps, f"CKAN: {command}" + (f" ({params_short})" if params_short else ""))
+
+    import time as _time
+    t0 = _time.monotonic()
     start_time = datetime.now(timezone.utc)
-    log.info(f"ckan_run starting: action='{command}', params={json.dumps(parameters)[:100]}")
-    
+    log.info(f"ckan_run starting: action='{command}', params={json.dumps(parameters, ensure_ascii=False)[:200]}")
+
+    if _bypass_ckan_agent(command):
+        log.info(f"ckan_run bypassing ckan_agent for '{command}'")
+        try:
+            merged_params = merge_with_smart_defaults(command, parameters)
+            _push_status(ctx.deps, f"Fetching data from CKAN: {command}" + (f" ({params_short})" if params_short else ""))
+
+            t_fetch_start = _time.monotonic()
+            response, fetch_method = await _ckan_fetch_data(ctx.deps, command, merged_params)
+            t_fetch_end = _time.monotonic()
+
+            _push_status(ctx.deps, f"Processing response from {command}")
+            truncated = smart_truncate_response(response)
+
+            result_dict = {
+                'status': 'success',
+                'action_name': command,
+                'parameters': parameters,
+                'result': truncated['data'],
+                '_truncated': truncated['truncated'],
+                '_truncation_method': truncated['truncation_method'],
+                '_total_items': truncated['total_items'],
+                '_showing_items': truncated['showing_items'],
+                '_estimated_tokens': truncated['estimated_tokens'],
+            }
+
+            t_total = _time.monotonic()
+            log.info(f"ckan_run complete (fast): action='{command}', "
+                    f"method={fetch_method}, "
+                    f"fetch={t_fetch_end - t_fetch_start:.1f}s, total={t_total - t0:.1f}s, "
+                    f"items={truncated['showing_items']}/{truncated['total_items']}")
+            _push_status(ctx.deps, f"CKAN complete: {truncated['showing_items']}/{truncated['total_items']} items ({t_total - t0:.1f}s)")
+
+            return json.dumps(result_dict)
+
+        except KeyError as e:
+            log.warning(f"ckan_run fast path KeyError: action='{command}', error={e}")
+            return json.dumps({"status": "fail", "action_name": command, "result": f"Action '{command}' not found: {e}", "comment": "Check action name"})
+        except Exception as e:
+            log.error(f"ckan_run fast path error: action='{command}', error_type={type(e).__name__}, error={str(e)[:200]}")
+            return json.dumps({"status": "fail", "action_name": command, "result": f"{type(e).__name__}: {str(e)}", "comment": "Action failed"})
+
+    # Agent path: use ckan_agent for parameter optimization
+    _push_status(ctx.deps, f"Validating query parameters for {command}" + (f" ({params_short})" if params_short else ""))
+
     try:
         r = await asyncio.wait_for(
             ckan_agent.run(
@@ -860,13 +1050,12 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
             ),
             timeout=config.CKAN_RUN_TIMEOUT
         )
-        
-        # Track usage metrics
+
+        t_agent = _time.monotonic()
         usage = r.usage()
-        duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-        log.info(f"ckan_run agent validation: action='{command}', "
-                f"tokens=[request:{usage.request_tokens}, response:{usage.response_tokens}, total:{usage.total_tokens}], "
-                f"duration_ms={duration_ms:.0f}")
+        log.info(f"ckan_run agent done: action='{command}', "
+                f"agent_time={t_agent - t0:.1f}s, "
+                f"requests={usage.request_tokens}req/{usage.response_tokens}resp/{usage.total_tokens}total")
         
         # Log what ckan_agent returned
         ckan_result = r.output
@@ -879,31 +1068,14 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
                 corrected_action = ckan_result.action_name or command
                 corrected_params = ckan_result.parameters or parameters
                 merged_params = merge_with_smart_defaults(corrected_action, corrected_params)
+                corrected_params_short = _format_params_short(corrected_params)
+                _push_status(ctx.deps, f"Fetching data from CKAN: {corrected_action}" + (f" ({corrected_params_short})" if corrected_params_short else ""))
 
-                response = None
-                fetch_method = "direct"
+                t_fetch_start = _time.monotonic()
+                response, fetch_method = await _ckan_fetch_data(ctx.deps, corrected_action, merged_params)
+                t_fetch_end = _time.monotonic()
 
-                # Try MCP first if available
-                if ctx.deps.mcp_url and ctx.deps.mcp_token:
-                    response = await _mcp_fetch_data(
-                        ctx.deps.mcp_url, ctx.deps.mcp_token,
-                        corrected_action, merged_params,
-                    )
-                    if response is not None:
-                        fetch_method = "mcp"
-
-                # Fallback to direct toolkit call
-                if response is None:
-                    user = CKANmodel.User.get(user_reference=ctx.deps.user_id)
-                    context = {
-                        "user": user.name,
-                        "auth_user_obj": user,
-                        "model": CKANmodel,
-                        "session": CKANmodel.Session,
-                        "ignore_auth": False,
-                    }
-                    response = toolkit.get_action(corrected_action)(context, merged_params)
-
+                _push_status(ctx.deps, f"Processing response from {corrected_action}")
                 truncated = smart_truncate_response(response)
 
                 result_dict = ckan_result.model_dump()
@@ -914,15 +1086,15 @@ async def ckan_run(ctx: RunContext[Deps], command: str, parameters: dict={}) -> 
                 result_dict['_showing_items'] = truncated['showing_items']
                 result_dict['_estimated_tokens'] = truncated['estimated_tokens']
 
-                total_duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-                log.info(f"ckan_run data fetch complete: action='{command}', "
+                t_total = _time.monotonic()
+                log.info(f"ckan_run complete: action='{command}', "
                         f"method={fetch_method}, "
-                        f"truncation={truncated['truncation_method']}, "
-                        f"items={truncated['showing_items']}/{truncated['total_items']}, "
-                        f"total_duration_ms={total_duration_ms:.0f}")
+                        f"agent={t_agent - t0:.1f}s, fetch={t_fetch_end - t_fetch_start:.1f}s, total={t_total - t0:.1f}s, "
+                        f"items={truncated['showing_items']}/{truncated['total_items']}")
+
+                _push_status(ctx.deps, f"CKAN complete: {truncated['showing_items']}/{truncated['total_items']} items ({t_total - t0:.1f}s)")
 
                 final_result = json.dumps(result_dict)
-                log.debug(f"ckan_run final result size: {len(final_result)} chars")
                 return final_result
             except Exception as e:
                 log.error(f"ckan_run data fetch error: {str(e)[:200]}")
@@ -1068,10 +1240,11 @@ def run_action(ctx: RunContext[Deps], action_name: str, parameters: Dict) -> Any
     }
     
     try:
-        # Execute CKAN action
+        import time as _time
+        t_action = _time.monotonic()
         response = toolkit.get_action(action_name)(context, merged_parameters)
-        
-        # Measure response (but don't process it)
+        log.info(f"run_action executed: action='{action_name}', time={_time.monotonic() - t_action:.3f}s")
+
         json_str = json.dumps(response)
         response_size_bytes = len(json_str)
         estimated_tokens = response_size_bytes // 4
@@ -1138,16 +1311,22 @@ async def get_resource_file_contents(
     Retrieves the content of a resource stored in filetore, allows setting max_length of output and offset to extract a slice of content
 
     Args:
-        resource_url (str): The download url of the CKAN resource
+        resource_url (str): The download url of the CKAN resource (must start with http:// or https://)
         ssl_verify (bool): Whether to verify SSL certificates. Defaults to config value.
 
     Returns:
         TextResource: The raw string content of the file retrieved
     """
+    if not resource_url or not resource_url.startswith(("http://", "https://")):
+        raise ValueError(
+            f"Invalid resource URL: '{resource_url}'. Must be a full HTTP(S) URL. "
+            "Do not pass internal file IDs or UUIDs — only CKAN resource download URLs."
+        )
+
     # Read SSL verification from config if not explicitly provided
     if ssl_verify is None:
         ssl_verify = toolkit.config.get("ckanext.chat.ssl_verify", True)
-    
+
     ckan_url = toolkit.config.get("ckan.site_url")
     try:
         resource = TextResource(url=resource_url)
@@ -1312,14 +1491,17 @@ async def get_embedding(chunks: List[str], model: str, api_url, vector_dim: int)
         return [vec.embedding for vec in emb_r.data]
     headers = {"accept": "application/json", "Content-Type": "application/json"}
     data = {"chunks": chunks, "model": model}
+    embedding_timeout = int(toolkit.config.get("ckanext.chat.embedding_timeout", 15))
+    log.info(f"get_embedding requesting {api_url} model={model} chunks={len(chunks)} timeout={embedding_timeout}s")
     response = requests.post(
-        api_url, headers=headers, data=json.dumps(data), verify=False
+        api_url, headers=headers, data=json.dumps(data), verify=False, timeout=embedding_timeout
     )
+    log.info(f"get_embedding response status={response.status_code}")
 
     if response.status_code == 200:
         return response.json()["embeddings"]
     else:
-        return {"error": response.status_code, "message": response.text}
+        raise RuntimeError(f"Embedding service error {response.status_code}: {response.text}")
 
 
 @rag_agent.tool
@@ -1339,38 +1521,45 @@ async def rag_search(
     if not ctx.deps.milvus_client or not ctx.deps.embeddings:
         return "The Milvus Client was not setup properly, no rag_search supported in the moment."
     else:
+        _push_status(ctx.deps, f"Vector search: {len(search_query)} queries, limit={limit}")
+        log.info(f"rag_search starting: queries={len(search_query)} limit={limit}")
+        _push_status(ctx.deps, "Generating embeddings for search queries")
         query_vectors = await get_embedding(
             search_query,
             model=ctx.deps.embedding_model,
             api_url=ctx.deps.embeddings,
             vector_dim=ctx.deps.vector_dim,
         )
-        num_results = 0
+        log.info(f"rag_search embedding done, starting milvus search")
+        _push_status(ctx.deps, "Searching vector database")
         hits = []
-        filter_ids = []
-        while num_results < limit:
-            log.debug(f"{search_query} filtered by: {filter_ids}")
+        seen_ids = set()
+        while len(hits) < limit:
+            filter_ids = list(seen_ids)
             search_res = ctx.deps.milvus_client.search(
                 collection_name=ctx.deps.collection_name,
                 data=query_vectors,
                 search_params={"metric_type": "COSINE", "params": {"level": 1}},
-                limit=6,
+                limit=limit,
                 filter_params={"ids": filter_ids} if filter_ids else None,
                 filter="id not in {ids}" if filter_ids else None,
                 output_fields=list(VectorMeta.__fields__.keys()),
                 consistency_level="Bounded",
             )
-            if search_res:
-                for i in range(len(query_vectors)):
-                    hit = [RagHit(**item) for item in search_res[i]]
-                    hits += hit
-                    filter_ids += list(set(hit.id for hit in hits))
-                    # log.debug(hits)
-                distinct_sources = list(set(hit.entity.source for hit in hits))
-                num_results = len(distinct_sources)
-                log.debug(
-                    f"Rag search for:{search_query} with limit: {limit} returned {num_results} results."
-                )
+            new_hits = 0
+            for result_per_vector in search_res:
+                for item in result_per_vector:
+                    rag_hit = RagHit(**item)
+                    if rag_hit.id not in seen_ids:
+                        seen_ids.add(rag_hit.id)
+                        hits.append(rag_hit)
+                        new_hits += 1
+            if new_hits == 0:
+                break
+            log.info(f"rag_search milvus: {len(hits)}/{limit} unique hits")
+        hits = hits[:limit]
+        _push_status(ctx.deps, f"Analyzing vector search results: {len(hits)} hits")
+        log.info(f"rag_search completed: {len(hits)} hits")
         return hits
         
 
@@ -1384,10 +1573,13 @@ async def literature_search(
     ctx: RunContext[Deps], search_question: str, num_results: int = 5
 ) -> list[str]:
     start_time = datetime.now(timezone.utc)
-    log.info(f"literature_search starting: query='{search_question[:100]}...', num_results={num_results}")
-    
+    _push_status(ctx.deps, f"Literature search: \"{search_question}\"")
+    log.info(f"literature_search starting: query='{search_question}...', num_results={num_results}")
+
     for attempt in range(config.MAX_RETRIES_LITERATURE_SEARCH):
         try:
+            if attempt > 0:
+                _push_status(ctx.deps, f"Retrying literature search (attempt {attempt+1})")
             log.debug(f"literature_search attempt {attempt+1}/{config.MAX_RETRIES_LITERATURE_SEARCH}")
             r = await asyncio.wait_for(
                 rag_agent.run(
@@ -1404,19 +1596,17 @@ async def literature_search(
             # Track usage metrics
             usage = r.usage()
             duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+            _push_status(ctx.deps, f"Literature search complete ({duration_ms/1000:.1f}s)")
             log.info(f"literature_search completed: attempt={attempt+1}, "
                     f"tokens=[request:{usage.request_tokens}, response:{usage.response_tokens}, total:{usage.total_tokens}], "
                     f"duration_ms={duration_ms:.0f}")
-            
+
             return r.output.model_dump_json()
             
         except asyncio.TimeoutError:
             duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
-            log.warning(f"literature_search timeout on attempt {attempt+1}/3, duration_ms={duration_ms:.0f}")
-            if attempt == 2:  # Last attempt
-                log.error(f"literature_search all retries timed out after {duration_ms:.0f}ms")
-                raise RuntimeError("All literature_search retries timed out")
-            continue
+            log.warning(f"literature_search timeout on attempt {attempt+1}/{config.MAX_RETRIES_LITERATURE_SEARCH}, duration_ms={duration_ms:.0f}")
+            return json.dumps({"answer": "", "error": [f"Literature search timed out after {duration_ms/1000:.0f}s"]})
             
         except UsageLimitExceeded as e:
             log.error(f"literature_search usage limit exceeded on attempt {attempt+1}: {e}")
@@ -1424,49 +1614,53 @@ async def literature_search(
             
         except ModelHTTPError as e:
             log.error(f"literature_search API error on attempt {attempt+1}: status={e.status_code if hasattr(e, 'status_code') else 'unknown'}")
-            if attempt == 2:
+            if attempt == config.MAX_RETRIES_LITERATURE_SEARCH - 1:
                 return json.dumps({"answer": "", "error": [f"API error: {str(e)}"]})
             continue
             
         except UnexpectedModelBehavior as e:
             log.error(f"literature_search model behavior error on attempt {attempt+1}: {str(e)[:200]}")
-            if attempt == 2:
+            if attempt == config.MAX_RETRIES_LITERATURE_SEARCH - 1:
                 return json.dumps({"answer": "", "error": [f"Model output validation failed: {str(e)}"]})
             continue
             
         except Exception as e:
             log.error(f"literature_search unexpected error on attempt {attempt+1}: error_type={type(e).__name__}, error={str(e)[:200]}")
-            if attempt == 2:
-                raise RuntimeError(f"All literature_search retries failed: {type(e).__name__}: {str(e)}")
+            if attempt == config.MAX_RETRIES_LITERATURE_SEARCH - 1:
+                return json.dumps({"answer": "", "error": [f"Literature search failed: {type(e).__name__}: {str(e)[:200]}"]})
             continue
-    
-    # Should not reach here, but just in case
-    raise RuntimeError("All literature_search retries exhausted")
 
-@agent.tool_plain
-@research_agent.tool_plain
-async def literature_analyse(doc: TextResource, question: str, ssl_verify: bool = None) -> list[str]:
+    return json.dumps({"answer": "", "error": ["All literature_search retries exhausted"]})
+
+@agent.tool
+@research_agent.tool
+async def literature_analyse(ctx: RunContext[Deps], doc: TextResource, question: str, ssl_verify: bool = None) -> list[str]:
     """
     Analyze a document to answer a question.
-    
+
     Args:
+        ctx: The runtime context with dependencies
         doc: TextResource with document URL
         question: Question to answer
         ssl_verify: Whether to verify SSL certificates. Defaults to config value.
-    
+
     Returns:
         JSON string with analysis results
     """
     # Read SSL verification from config if not explicitly provided
     if ssl_verify is None:
         ssl_verify = toolkit.config.get("ckanext.chat.ssl_verify", True)
-    
+
+    doc_filename = str(doc.url).rsplit('/', 1)[-1] if doc.url else "unknown"
+    _push_status(ctx.deps, f"Analyzing: {doc_filename}")
     start_time = datetime.now(timezone.utc)
     log.info(f"literature_analyse starting: doc_url='{doc.url}', question='{question[:100]}...'")
-    
+
+    _push_status(ctx.deps, f"Loading document: {doc_filename}")
     try:
         doc=await get_resource_file_contents(resource_url=str(doc.url),ssl_verify=ssl_verify)
         log.debug(f"literature_analyse loaded document: length={doc.length} chars")
+        _push_status(ctx.deps, f"Document loaded: {doc_filename} ({doc.length:,} chars)")
     except Exception as e:
         log.error(f"literature_analyse failed to load document: error={str(e)[:200]}")
         return json.dumps({"answer": "", "source": str(doc.url), "error": [f"Failed to load document: {str(e)}"]})
@@ -1475,7 +1669,8 @@ async def literature_analyse(doc: TextResource, question: str, ssl_verify: bool 
         f"Analyze the provided TextResource to determine whether it contains an answer to the question below.\n\n"
         f"**Question:** {question}\n\n"
     )
-    
+
+    _push_status(ctx.deps, f"Extracting relevant passages: {doc_filename}")
     try:
         r = await asyncio.wait_for(
             doc_agent.run(
@@ -1492,14 +1687,16 @@ async def literature_analyse(doc: TextResource, question: str, ssl_verify: bool 
         # Track usage metrics
         usage = r.usage()
         duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+        _push_status(ctx.deps, f"Analysis complete: {doc_filename} ({duration_ms/1000:.1f}s)")
         log.info(f"literature_analyse completed: "
                 f"tokens=[request:{usage.request_tokens}, response:{usage.response_tokens}, total:{usage.total_tokens}], "
                 f"duration_ms={duration_ms:.0f}")
-        
+
         return r.output.model_dump_json()
-        
+
     except asyncio.TimeoutError:
         duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+        _push_status(ctx.deps, f"Analysis timeout: {doc_filename}")
         log.error(f"literature_analyse timeout after {duration_ms:.0f}ms, limit=120000ms")
         return json.dumps({"answer": "", "source": str(doc.url), "error": ["Analysis timeout after 120 seconds"]})
         

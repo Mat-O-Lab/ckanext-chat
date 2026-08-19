@@ -131,6 +131,7 @@ ckan.module("chat-module", function ($, _) {
 
     // Called automatically when the module is instantiated
     initialize: function () {
+      this.abortController = null;
       this.bindUI();
       this.loadPreviousChats();
       this.loadChat();
@@ -155,6 +156,9 @@ ckan.module("chat-module", function ($, _) {
       });
       this.el.find("#regenerateButton").on("click", function () {
         self.regenerateFailedMessage();
+      });
+      this.el.find("#abortButton").on("click", function () {
+        self.abortStream();
       });
       // Bind keydown event for the user input textarea
       this.el.find("#userInput").on("keydown", function (e) {
@@ -528,6 +532,13 @@ ckan.module("chat-module", function ($, _) {
       return null;
     },
 
+    abortStream: function () {
+      if (this.abortController) {
+        this.abortController.abort();
+        this.abortController = null;
+      }
+    },
+
     // Send a user message and then trigger a bot reply
     sendMessage: function () {
       var self = this;
@@ -548,16 +559,18 @@ ckan.module("chat-module", function ($, _) {
         self.appendMessage(messageObject);
         var chatHistory = self.getChatHistory();
         var sendButton = this.el.find("#sendButton");
+        var abortButton = this.el.find("#abortButton");
         var spinner = sendButton.find(".spinner-border");
         var buttonText = sendButton.find(".button-text");
         var icon = sendButton.find(".fa-paper-plane");
-        sendButton.prop("disabled", true);
+        sendButton.addClass("d-none");
+        abortButton.removeClass("d-none");
         spinner.removeClass("d-none");
         buttonText.addClass("d-none");
         icon.addClass("d-none");
 
         if (!chatHistory.length) {
-          $.post("chat/ask", {
+          $.post("/chat/ask", {
             text: "Output only a 3-word title for this question: " + text +". Return only the 3-word title as plain text, with no explanations, punctuation, or formatting.",
           })
             .done(function (data) {
@@ -570,7 +583,8 @@ ckan.module("chat-module", function ($, _) {
                 spinner.addClass("d-none");
                 buttonText.removeClass("d-none");
                 icon.removeClass("d-none");
-                sendButton.prop("disabled", false);
+                sendButton.removeClass("d-none");
+                abortButton.addClass("d-none");
               });
             })
             .fail(function () {
@@ -578,7 +592,8 @@ ckan.module("chat-module", function ($, _) {
               spinner.addClass("d-none");
               buttonText.removeClass("d-none");
               icon.removeClass("d-none");
-              sendButton.prop("disabled", false);
+              sendButton.removeClass("d-none");
+              abortButton.addClass("d-none");
             });
         } else {
           // Wenn Chat-Historie vorhanden ist, sende die Bot-Nachricht direkt
@@ -586,7 +601,8 @@ ckan.module("chat-module", function ($, _) {
             spinner.addClass("d-none");
             buttonText.removeClass("d-none");
             icon.removeClass("d-none");
-            sendButton.prop("disabled", false);
+            sendButton.removeClass("d-none");
+            abortButton.addClass("d-none");
           });
         }
       }
@@ -605,35 +621,138 @@ ckan.module("chat-module", function ($, _) {
       }
     },
 
-    // Send a request to the bot and append its reply
+    // Send a request to the bot via SSE streaming and append its reply
     sendBotMessage: function (text, label, callback) {
       var history = this.getChatHistory(label);
       var research_check = $("#researchToggle")
         .find('input[type="checkbox"]')
         .prop("checked");
       var self = this;
-      $.ajax({
-        type: "POST",
-        url: "chat/ask",
-        data: {
-          text: text,
-          history: JSON.stringify(history),
-          research: research_check,
-        },
-        timeout: 200000, // Timeout auf 200 Sekunden setzen (200000 ms)
-        success: function (data) {
-          const chatindex = self.saveChat(data.response, label);
-          self.loadChat(chatindex);
-          if (callback) callback();
-        },
-        error: function (jqXHR, textStatus, errorThrown) {
-          if (textStatus === "timeout") {
-            alert("Die Anfrage hat zu lange gedauert.");
-          } else {
-            alert("Ein Fehler ist aufgetreten: " + textStatus);
+
+      var chatbox = self.el.find("#chatbox");
+      var statusEl = $(
+        '<div class="message bot-message" id="stream-status">' +
+          '<span class="col-2 chatavatar"><i class="fas fa-robot"></i></span>' +
+          '<div class="col-auto text status-list">' +
+            '<div class="status-line active">' +
+              '<i class="fas fa-spinner fa-spin"></i> ' +
+              '<span>Processing...</span>' +
+            '</div>' +
+          "</div>" +
+        "</div>",
+      );
+      chatbox.append(statusEl);
+      statusEl[0].scrollIntoView({ behavior: "smooth", block: "start" });
+
+      self.abortController = new AbortController();
+
+      var params = new URLSearchParams();
+      params.append("text", text);
+      params.append("history", JSON.stringify(history));
+      params.append("research", research_check);
+
+      fetch("/chat/ask/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: params,
+        credentials: "same-origin",
+        signal: self.abortController.signal,
+      })
+        .then(function (response) {
+          if (!response.ok) {
+            throw new Error("HTTP " + response.status);
           }
-        },
-      });
+          var reader = response.body.getReader();
+          var decoder = new TextDecoder();
+          var buffer = "";
+
+          function processChunk() {
+            reader
+              .read()
+              .then(function (result) {
+                if (result.done) {
+                  statusEl.remove();
+                  self.abortController = null;
+                  if (callback) callback();
+                  return;
+                }
+
+                buffer += decoder.decode(result.value, { stream: true });
+                var events = buffer.split("\n\n");
+                buffer = events.pop();
+
+                events.forEach(function (eventStr) {
+                  if (!eventStr.trim()) return;
+                  var eventType = "";
+                  var dataStr = "";
+                  eventStr.split("\n").forEach(function (line) {
+                    if (line.startsWith("event: "))
+                      eventType = line.slice(7);
+                    if (line.startsWith("data: "))
+                      dataStr = line.slice(6);
+                  });
+
+                  if (eventType === "status" && dataStr) {
+                    try {
+                      var data = JSON.parse(dataStr);
+                      var list = statusEl.find(".status-list");
+                      list.find(".status-line.active")
+                        .removeClass("active")
+                        .find("i")
+                        .removeClass("fa-spinner fa-spin")
+                        .addClass("fa-check");
+                      list.append(
+                        '<div class="status-line active">' +
+                          '<i class="fas fa-spinner fa-spin"></i> ' +
+                          "<span>" + $("<span>").text(data.message).html() + "</span>" +
+                        "</div>"
+                      );
+                      statusEl[0].scrollIntoView({
+                        behavior: "smooth",
+                        block: "start",
+                      });
+                    } catch (e) {
+                      console.error("Status parse error:", e);
+                    }
+                  } else if (eventType === "done" && dataStr) {
+                    try {
+                      statusEl.remove();
+                      var data = JSON.parse(dataStr);
+                      var chatindex = self.saveChat(data.response, label);
+                      self.loadChat(chatindex);
+                    } catch (e) {
+                      console.error("Response parse error:", e);
+                    }
+                  }
+                });
+
+                processChunk();
+              })
+              .catch(function (err) {
+                statusEl.remove();
+                self.abortController = null;
+                if (err.name === "AbortError") {
+                  console.log("Stream aborted by user");
+                } else {
+                  console.error("Stream read error:", err);
+                  alert("Ein Fehler ist aufgetreten: " + err);
+                }
+                if (callback) callback();
+              });
+          }
+
+          processChunk();
+        })
+        .catch(function (err) {
+          statusEl.remove();
+          self.abortController = null;
+          if (err.name === "AbortError") {
+            console.log("Stream aborted by user");
+          } else {
+            alert("Ein Fehler ist aufgetreten: " + err);
+          }
+          if (callback) callback();
+        });
     },
 
     // Save new messages to the chat history in localStorage

@@ -323,6 +323,18 @@ pip install -e ".[dev]"
 pytest --ckan-ini=test.ini
 ```
 
+## AI-Assisted Documentation
+
+Parts of this repository were created with the assistance of artificial intelligence (AI) tools. While the content has been reviewed and edited for accuracy, users should:
+
+- Verify critical information independently
+- Report any errors or inconsistencies via the GitHub issue tracker
+- Exercise due diligence when following instructions
+- The use of AI does not affect the functionality or reliability of the software itself.
+
+
+
 ## License
 
 [AGPL](https://www.gnu.org/licenses/agpl-3.0.en.html)
+
